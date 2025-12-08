@@ -1,10 +1,13 @@
 """
 MOH Tender OCR Web Application - FastAPI Backend
+With integrated scraper support
 """
 import os
+import sys
 import json
 import shutil
 import asyncio
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any
@@ -16,6 +19,24 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
+
+# ============================================================================
+# SCRAPER CONFIGURATION
+# ============================================================================
+SCRAPER_SCRIPT = os.path.expanduser("~/Documents/moh_tender_scraper_with_ocr.py")
+SCRAPER_PYTHON = os.path.expanduser("~/Documents/MOH Tenders/scripts/moh_env/bin/python3")
+MOH_TENDERS_DIR = os.path.expanduser("~/Documents/MOH Tenders")
+OCR_RESULTS_DIR = os.path.expanduser("~/Documents/MOH Tenders/ocr_results")
+
+# Scraper status tracking
+scraper_status = {
+    "running": False,
+    "progress": 0.0,
+    "message": "Idle",
+    "pid": None,
+    "last_run": None,
+    "tenders_found": 0
+}
 
 # Import OCR components from local ocr_engine module (improved copy)
 try:
@@ -648,6 +669,389 @@ async def batch_process(background_tasks: BackgroundTasks, status: str = "pendin
     return {"message": f"Started processing {len(pending)} tenders", "count": len(pending)}
 
 # ============================================================================
+# SCRAPER ENDPOINTS
+# ============================================================================
+
+class ScraperRequest(BaseModel):
+    department: Optional[str] = None  # 'Medical Store', 'Biomedical Engineering', or None for all
+    headless: bool = True
+    max_pages: int = 10
+
+async def run_scraper_task(mode: str = "scrape", pdf_folder: str = None, output_folder: str = None):
+    """Run the scraper script as a background task"""
+    global scraper_status
+
+    scraper_status["running"] = True
+    scraper_status["progress"] = 0.0
+    scraper_status["message"] = "Starting scraper..."
+
+    try:
+        cmd = [SCRAPER_PYTHON, SCRAPER_SCRIPT]
+
+        if mode == "batch" and pdf_folder:
+            cmd.extend(["--batch", pdf_folder])
+            if output_folder:
+                cmd.extend(["--output", output_folder])
+            cmd.extend(["--pages", "10"])
+        else:
+            # Normal scraping mode
+            cmd.extend(["--headless"])
+
+        scraper_status["message"] = f"Running: {' '.join(cmd)}"
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        scraper_status["pid"] = process.pid
+
+        stdout, stderr = await process.communicate()
+
+        if process.returncode == 0:
+            scraper_status["message"] = "Scraper completed successfully"
+            scraper_status["progress"] = 100.0
+        else:
+            error_msg = stderr.decode() if stderr else "Unknown error"
+            scraper_status["message"] = f"Scraper failed: {error_msg[:200]}"
+
+    except Exception as e:
+        scraper_status["message"] = f"Error: {str(e)}"
+
+    finally:
+        scraper_status["running"] = False
+        scraper_status["last_run"] = datetime.now().isoformat()
+        scraper_status["pid"] = None
+
+
+@app.get("/api/scraper/status")
+async def get_scraper_status():
+    """Get current scraper status"""
+    # Check OCR results for recent files
+    tenders_found = 0
+    if os.path.exists(OCR_RESULTS_DIR):
+        for f in os.listdir(OCR_RESULTS_DIR):
+            if f.endswith('.xlsx') or f.endswith('.json'):
+                tenders_found += 1
+
+    return {
+        **scraper_status,
+        "script_exists": os.path.exists(SCRAPER_SCRIPT),
+        "python_exists": os.path.exists(SCRAPER_PYTHON),
+        "tenders_dir": MOH_TENDERS_DIR,
+        "results_dir": OCR_RESULTS_DIR,
+        "result_files": tenders_found
+    }
+
+
+@app.post("/api/scraper/start")
+async def start_scraper(background_tasks: BackgroundTasks):
+    """Start the MOH website scraper to download new tenders"""
+    global scraper_status
+
+    if scraper_status["running"]:
+        raise HTTPException(status_code=400, detail="Scraper is already running")
+
+    if not os.path.exists(SCRAPER_SCRIPT):
+        raise HTTPException(status_code=404, detail=f"Scraper script not found: {SCRAPER_SCRIPT}")
+
+    if not os.path.exists(SCRAPER_PYTHON):
+        raise HTTPException(status_code=404, detail=f"Python not found: {SCRAPER_PYTHON}")
+
+    background_tasks.add_task(run_scraper_task, "scrape")
+
+    return {
+        "message": "Scraper started",
+        "script": SCRAPER_SCRIPT
+    }
+
+
+@app.post("/api/scraper/batch-ocr")
+async def start_batch_ocr(
+    background_tasks: BackgroundTasks,
+    folder: str = Query(default=None, description="PDF folder to process"),
+    department: str = Query(default=None, description="Department: 'medical' or 'biomedical'")
+):
+    """Start batch OCR processing on existing PDFs using your script"""
+    global scraper_status
+
+    if scraper_status["running"]:
+        raise HTTPException(status_code=400, detail="Scraper/OCR is already running")
+
+    # Determine which folder to process
+    if folder:
+        pdf_folder = folder
+    elif department:
+        if "medical" in department.lower():
+            pdf_folder = os.path.join(MOH_TENDERS_DIR, "Medical_Store")
+        elif "biomedical" in department.lower():
+            pdf_folder = os.path.join(MOH_TENDERS_DIR, "Biomedical_Engineering")
+        else:
+            pdf_folder = MOH_TENDERS_DIR
+    else:
+        pdf_folder = MOH_TENDERS_DIR
+
+    if not os.path.exists(pdf_folder):
+        raise HTTPException(status_code=404, detail=f"Folder not found: {pdf_folder}")
+
+    background_tasks.add_task(run_scraper_task, "batch", pdf_folder, OCR_RESULTS_DIR)
+
+    return {
+        "message": "Batch OCR started",
+        "pdf_folder": pdf_folder,
+        "output_folder": OCR_RESULTS_DIR
+    }
+
+
+@app.post("/api/scraper/stop")
+async def stop_scraper():
+    """Stop the running scraper"""
+    global scraper_status
+
+    if not scraper_status["running"]:
+        return {"message": "Scraper is not running"}
+
+    if scraper_status["pid"]:
+        try:
+            import signal
+            os.kill(scraper_status["pid"], signal.SIGTERM)
+            scraper_status["message"] = "Scraper stopped by user"
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            return {"message": f"Failed to stop: {str(e)}"}
+
+    scraper_status["running"] = False
+    scraper_status["pid"] = None
+
+    return {"message": "Scraper stopped"}
+
+
+@app.get("/api/scraper/results")
+async def get_scraper_results():
+    """Get list of OCR result files"""
+    if not os.path.exists(OCR_RESULTS_DIR):
+        return {"results": [], "total": 0}
+
+    results = []
+    for f in sorted(os.listdir(OCR_RESULTS_DIR), reverse=True):
+        if f.endswith('.xlsx') or f.endswith('.json'):
+            filepath = os.path.join(OCR_RESULTS_DIR, f)
+            stat = os.stat(filepath)
+            results.append({
+                "filename": f,
+                "size": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                "type": "excel" if f.endswith('.xlsx') else "json"
+            })
+
+    return {"results": results[:50], "total": len(results)}
+
+
+@app.get("/api/scraper/download/{filename}")
+async def download_result_file(filename: str):
+    """Download an OCR result file"""
+    filepath = os.path.join(OCR_RESULTS_DIR, filename)
+
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if filename.endswith('.xlsx') else "application/json"
+
+    return FileResponse(
+        path=filepath,
+        filename=filename,
+        media_type=media_type
+    )
+
+
+@app.get("/api/scraper/pdfs")
+async def list_pdf_folders():
+    """List available PDF folders for batch processing"""
+    folders = []
+
+    if os.path.exists(MOH_TENDERS_DIR):
+        for item in os.listdir(MOH_TENDERS_DIR):
+            item_path = os.path.join(MOH_TENDERS_DIR, item)
+            if os.path.isdir(item_path):
+                pdf_count = sum(1 for f in os.listdir(item_path) if f.lower().endswith('.pdf'))
+                if pdf_count > 0:
+                    folders.append({
+                        "name": item,
+                        "path": item_path,
+                        "pdf_count": pdf_count
+                    })
+
+    return {"folders": folders, "base_dir": MOH_TENDERS_DIR}
+
+
+# ============================================================================
+# TENDER MANAGEMENT API (with AI Enhancement)
+# ============================================================================
+
+# Import tender manager
+try:
+    from tender_manager import get_tender_manager, get_ai_engine
+    TENDER_MANAGER_AVAILABLE = True
+    print("✅ Tender Manager loaded with AI enhancement")
+except ImportError as e:
+    print(f"Warning: Tender Manager not available: {e}")
+    TENDER_MANAGER_AVAILABLE = False
+
+
+@app.get("/api/manager/dashboard")
+async def get_manager_dashboard():
+    """Get tender management dashboard statistics"""
+    if not TENDER_MANAGER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Tender Manager not available")
+
+    manager = get_tender_manager()
+    return manager.get_dashboard_stats()
+
+
+@app.get("/api/manager/tenders")
+async def get_managed_tenders(
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=50, ge=1, le=200),
+    search: str = Query(default=None),
+    department: str = Query(default=None)
+):
+    """Get paginated list of tenders with filtering"""
+    if not TENDER_MANAGER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Tender Manager not available")
+
+    manager = get_tender_manager()
+    return manager.get_all_tenders(page=page, limit=limit, search=search, department=department)
+
+
+@app.get("/api/manager/tenders/{reference}")
+async def get_managed_tender(reference: str):
+    """Get a single tender by reference"""
+    if not TENDER_MANAGER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Tender Manager not available")
+
+    manager = get_tender_manager()
+    tender = manager.get_tender(reference)
+    if not tender:
+        raise HTTPException(status_code=404, detail="Tender not found")
+    return tender
+
+
+@app.post("/api/manager/enhance/{reference}")
+async def enhance_single_tender(reference: str):
+    """Apply AI enhancement to a single tender"""
+    if not TENDER_MANAGER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Tender Manager not available")
+
+    manager = get_tender_manager()
+    result = manager.enhance_tender(reference)
+    if 'error' in result:
+        raise HTTPException(status_code=404, detail=result['error'])
+    return result
+
+
+class EnhanceBatchRequest(BaseModel):
+    references: Optional[List[str]] = None
+    limit: int = 10
+
+
+@app.post("/api/manager/enhance-batch")
+async def enhance_batch_tenders(request: EnhanceBatchRequest, background_tasks: BackgroundTasks):
+    """Apply AI enhancement to multiple tenders"""
+    if not TENDER_MANAGER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Tender Manager not available")
+
+    manager = get_tender_manager()
+
+    # Run in background for large batches
+    if request.limit > 5:
+        background_tasks.add_task(manager.enhance_batch, request.references, request.limit)
+        return {"message": f"Started enhancing up to {request.limit} tenders in background"}
+
+    result = manager.enhance_batch(request.references, request.limit)
+    return result
+
+
+@app.get("/api/manager/search")
+async def search_tender_items(
+    q: str = Query(..., min_length=2),
+    limit: int = Query(default=50, ge=1, le=200)
+):
+    """Search across all tender items"""
+    if not TENDER_MANAGER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Tender Manager not available")
+
+    manager = get_tender_manager()
+    return {"results": manager.search_items(q, limit)}
+
+
+@app.get("/api/manager/departments")
+async def get_departments():
+    """Get list of unique departments"""
+    if not TENDER_MANAGER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Tender Manager not available")
+
+    manager = get_tender_manager()
+    return {"departments": manager.get_departments()}
+
+
+@app.post("/api/manager/reload")
+async def reload_tender_data():
+    """Reload all tender data from OCR results"""
+    if not TENDER_MANAGER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Tender Manager not available")
+
+    manager = get_tender_manager()
+    manager.reload_from_ocr()
+    return {"message": "Reloaded", "total_tenders": len(manager.tenders)}
+
+
+@app.get("/api/manager/ai-stats")
+async def get_ai_stats():
+    """Get AI engine statistics"""
+    if not TENDER_MANAGER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Tender Manager not available")
+
+    engine = get_ai_engine()
+    return engine.get_stats()
+
+
+class ExportRequest(BaseModel):
+    references: Optional[List[str]] = None
+
+
+@app.post("/api/manager/export")
+async def export_managed_tenders(request: ExportRequest):
+    """Export tenders to Excel file"""
+    if not TENDER_MANAGER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Tender Manager not available")
+
+    manager = get_tender_manager()
+    try:
+        filepath = manager.export_to_excel(request.references)
+        return {"filepath": filepath, "filename": os.path.basename(filepath)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/manager/export/download/{filename}")
+async def download_export_file(filename: str):
+    """Download an exported file"""
+    export_dir = os.path.expanduser("~/Documents/MOH Tenders/ai_enhanced")
+    filepath = os.path.join(export_dir, filename)
+
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return FileResponse(
+        path=filepath,
+        filename=filename,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -656,5 +1060,6 @@ if __name__ == "__main__":
     print(f"Upload directory: {UPLOAD_DIR}")
     print(f"Data directory: {DATA_DIR}")
     print(f"OCR Available: {OCR_AVAILABLE}")
+    print(f"Tender Manager Available: {TENDER_MANAGER_AVAILABLE}")
 
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
