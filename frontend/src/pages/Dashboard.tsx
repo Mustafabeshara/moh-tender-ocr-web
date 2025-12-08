@@ -20,16 +20,16 @@ export default function Dashboard() {
     }
   };
 
-  const handleExport = async (format: 'excel' | 'json') => {
+  const handleExport = async () => {
     try {
-      const blob = await exportTenders(format, { status: 'completed' });
+      const blob = await exportTenders({ status: 'completed' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `tenders_export.${format === 'excel' ? 'xlsx' : 'json'}`;
+      a.download = 'tenders_export.xlsx';
       a.click();
       URL.revokeObjectURL(url);
-      toast.success(`Exported to ${format.toUpperCase()}`);
+      toast.success('Exported to Excel');
     } catch (error) {
       toast.error('Export failed');
     }
@@ -96,7 +96,7 @@ export default function Dashboard() {
             Process All Pending ({stats?.pending || 0})
           </button>
           <button
-            onClick={() => handleExport('excel')}
+            onClick={handleExport}
             disabled={!stats?.completed}
             className="btn-secondary flex items-center gap-2 disabled:opacity-50"
           >

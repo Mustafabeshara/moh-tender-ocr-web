@@ -124,12 +124,12 @@ export async function deleteItem(tenderId: string, itemIndex: number): Promise<T
   return response.data;
 }
 
-// Export tenders
-export async function exportTenders(format: 'excel' | 'json', params?: {
+// Export tenders to Excel
+export async function exportTenders(params?: {
   status?: string;
   tender_ids?: string;
 }): Promise<Blob> {
-  const response = await axios.get(`${API_BASE}/export/${format}`, {
+  const response = await axios.get(`${API_BASE}/export/excel`, {
     params,
     responseType: 'blob',
   });

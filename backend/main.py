@@ -543,9 +543,11 @@ async def export_tenders(
     status: Optional[str] = None,
     tender_ids: Optional[str] = None
 ):
-    """Export tenders to Excel or JSON"""
-    if format not in ["excel", "json"]:
-        raise HTTPException(status_code=400, detail="Format must be 'excel' or 'json'")
+    """Export tenders to Excel - appends to master file"""
+    if format != "excel":
+        raise HTTPException(status_code=400, detail="Only Excel export is supported")
+
+    import pandas as pd
 
     tenders = load_tenders()
 
@@ -561,73 +563,64 @@ async def export_tenders(
     if not export_data:
         raise HTTPException(status_code=404, detail="No tenders to export")
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Master Excel file - one file for all exports
+    export_path = EXPORT_DIR / "tenders_master.xlsx"
 
-    if format == "json":
-        export_path = EXPORT_DIR / f"tenders_export_{timestamp}.json"
-        with open(export_path, 'w', encoding='utf-8') as f:
-            json.dump(export_data, f, ensure_ascii=False, indent=2)
+    # Build new rows from export data
+    new_rows = []
+    for t in export_data:
+        items = t.get("items", [])
+        if not items:
+            items = [{"item_number": "", "description": "No items", "quantity": "", "unit": ""}]
+        for item in items:
+            new_rows.append({
+                "Tender ID": t.get("id", ""),
+                "Reference": t.get("reference", ""),
+                "Department": t.get("department", ""),
+                "Title": t.get("title", ""),
+                "Closing Date": t.get("closing_date", ""),
+                "Item #": item.get("item_number", ""),
+                "Description": item.get("description", ""),
+                "Quantity": item.get("quantity", ""),
+                "Unit": item.get("unit", ""),
+                "OCR Confidence": f"{t.get('ocr_confidence', 0):.1f}%",
+                "Export Date": datetime.now().strftime("%Y-%m-%d %H:%M")
+            })
 
-        return FileResponse(
-            path=str(export_path),
-            filename=f"tenders_export_{timestamp}.json",
-            media_type="application/json"
-        )
+    new_df = pd.DataFrame(new_rows)
 
-    else:  # Excel
-        export_path = EXPORT_DIR / f"tenders_export_{timestamp}.xlsx"
+    # If master file exists, load it and append (avoiding duplicates by Tender ID + Item #)
+    if export_path.exists():
+        try:
+            existing_df = pd.read_excel(str(export_path))
+            # Create unique key for deduplication
+            existing_df['_key'] = existing_df['Tender ID'].astype(str) + '_' + existing_df['Item #'].astype(str)
+            new_df['_key'] = new_df['Tender ID'].astype(str) + '_' + new_df['Item #'].astype(str)
 
-        # Convert to TenderData objects for export function
-        if OCR_AVAILABLE:
-            tender_objects = []
-            for t in export_data:
-                td = TenderData(
-                    reference=t.get("reference", ""),
-                    department=t.get("department", ""),
-                    title=t.get("title", ""),
-                    closing_date=t.get("closing_date", ""),
-                    ocr_confidence=t.get("ocr_confidence", 0),
-                    has_arabic_content=t.get("has_arabic_content", False),
-                    specifications=t.get("specifications", ""),
-                    source_files=[t.get("source_file", "")]
-                )
-                for item_data in t.get("items", []):
-                    td.items.append(TenderItem(
-                        item_number=item_data.get("item_number", ""),
-                        description=item_data.get("description", ""),
-                        quantity=item_data.get("quantity", ""),
-                        unit=item_data.get("unit", ""),
-                        language=item_data.get("language", ""),
-                        has_arabic=item_data.get("has_arabic", False)
-                    ))
-                tender_objects.append(td)
+            # Only add rows that don't already exist
+            existing_keys = set(existing_df['_key'].tolist())
+            new_df_filtered = new_df[~new_df['_key'].isin(existing_keys)]
 
-            export_to_excel(tender_objects, str(export_path))
-        else:
-            # Simple Excel export without the full function
-            import pandas as pd
-            rows = []
-            for t in export_data:
-                for item in t.get("items", [{"description": "No items"}]):
-                    rows.append({
-                        "Reference": t.get("reference", ""),
-                        "Department": t.get("department", ""),
-                        "Title": t.get("title", ""),
-                        "Closing Date": t.get("closing_date", ""),
-                        "Item #": item.get("item_number", ""),
-                        "Description": item.get("description", ""),
-                        "Quantity": item.get("quantity", ""),
-                        "Unit": item.get("unit", ""),
-                        "OCR Confidence": f"{t.get('ocr_confidence', 0):.1f}%"
-                    })
-            df = pd.DataFrame(rows)
-            df.to_excel(str(export_path), index=False)
+            # Drop the helper column
+            existing_df = existing_df.drop(columns=['_key'])
+            new_df_filtered = new_df_filtered.drop(columns=['_key'])
 
-        return FileResponse(
-            path=str(export_path),
-            filename=f"tenders_export_{timestamp}.xlsx",
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+            # Combine existing + new rows
+            combined_df = pd.concat([existing_df, new_df_filtered], ignore_index=True)
+        except Exception as e:
+            print(f"Error reading existing Excel: {e}, creating new file")
+            combined_df = new_df.drop(columns=['_key'], errors='ignore')
+    else:
+        combined_df = new_df.drop(columns=['_key'], errors='ignore')
+
+    # Save to master file
+    combined_df.to_excel(str(export_path), index=False)
+
+    return FileResponse(
+        path=str(export_path),
+        filename="tenders_master.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 @app.get("/api/pdf/{tender_id}")
 async def get_pdf(tender_id: str):
